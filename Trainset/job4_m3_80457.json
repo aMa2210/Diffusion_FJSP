@@ -1,0 +1,137 @@
+{
+  "machines": [
+    1,
+    2,
+    3
+  ],
+  "workpieces": [
+    {
+      "name": "Workpiece1",
+      "optional_machines": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1
+        ],
+        [
+          1,
+          2
+        ]
+      ],
+      "processing_time": [
+        [
+          6,
+          16,
+          5
+        ],
+        [
+          15
+        ],
+        [
+          14,
+          15
+        ]
+      ]
+    },
+    {
+      "name": "Workpiece2",
+      "optional_machines": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          2,
+          3
+        ]
+      ],
+      "processing_time": [
+        [
+          11,
+          13,
+          8
+        ],
+        [
+          6,
+          11,
+          10
+        ],
+        [
+          10,
+          5
+        ]
+      ]
+    },
+    {
+      "name": "Workpiece3",
+      "optional_machines": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1
+        ],
+        [
+          1
+        ]
+      ],
+      "processing_time": [
+        [
+          19,
+          7,
+          11
+        ],
+        [
+          11
+        ],
+        [
+          10
+        ]
+      ]
+    },
+    {
+      "name": "Workpiece4",
+      "optional_machines": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          2
+        ]
+      ],
+      "processing_time": [
+        [
+          6,
+          5,
+          18
+        ],
+        [
+          11,
+          8,
+          7
+        ],
+        [
+          8
+        ]
+      ]
+    }
+  ]
+}
