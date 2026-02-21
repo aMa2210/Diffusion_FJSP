@@ -12,8 +12,8 @@ def generate_random_fjsp_problem(
         max_ops: int = 8,
         min_opts: int = 1,
         max_opts: int = 4,
-        min_time: int = 5,
-        max_time: int = 20,
+        min_time: int = 8,
+        max_time: int = 15,
         seed: int = None
 ):
     """

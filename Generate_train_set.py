@@ -21,13 +21,13 @@ TOTAL_SAMPLES = 100000
 # 格式: (工件数量范围, 机器数量范围, 权重占比)
 PROBLEM_CONFIGS = [
     # [Small]  工件 5-10, 机器 3-5 (占比 20%) -> 适合初期快速学习逻辑
-    {"job_range": (4, 7), "mach_range": (3,4), "weight": 1},
+    {"job_range": (3, 6), "mach_range": (3,4), "weight": 1},
 ]
 
 # 工序参数 (可以根据实际工厂情况微调)
 MIN_OPS = 3  # 每个工件最少几道工序
-MAX_OPS = 7  # 每个工件最多几道工序
-MIN_OPTS = 1  # 每个工序最少有几个可选机器 (柔性)
+MAX_OPS = 5  # 每个工件最多几道工序
+MIN_OPTS = 2  # 每个工序最少有几个可选机器 (柔性)
 MAX_OPTS = 3  # 每个工序最多有几个可选机器
 
 

@@ -2,6 +2,7 @@ import json
 import csv
 import os
 import re
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
@@ -40,7 +41,10 @@ def load_ga_makespan_lookup_one_batch(ga_expert_batches_dir: str, batch_id: int)
     if not pt_file.exists():
         return {}
     try:
-        batch = torch.load(pt_file, map_location="cpu")
+        # GA 批次为 list of dict（含 tensors），需完整反序列化；显式 weights_only=False 并忽略安全提示
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            batch = torch.load(pt_file, map_location="cpu", weights_only=False)
         if not isinstance(batch, list):
             return {}
         lookup = {}
@@ -161,6 +165,8 @@ def build_and_solve_milp(
         big_m = max(total_max, ga_makespan_ub)
     else:
         big_m = total_max
+    big_m = 120
+    print(big_m)
     # -------------------- 定义 MILP 模型 --------------------
     model = pulp.LpProblem("FJSP_Makespan_Minimization", pulp.LpMinimize)
 
@@ -438,6 +444,11 @@ def _solve_one_instance(
     )
 
 
+def _solve_one_instance_unpack(args):
+    """供 ProcessPoolExecutor.map 使用：可 pickle 的包装，避免传 lambda."""
+    return _solve_one_instance(*args)
+
+
 def solve_all_in_dir_and_save(
     folder: str = "TestSet/Generalization_Temp",
     output_csv: str = "result_milp_generalization_temp.csv",
@@ -601,7 +612,7 @@ def solve_trainset_and_save_batches(
             bid = int(pt_file.stem.split("_")[-1])
             existing_batches.add(bid)
         except (ValueError, IndexError):
-            pass
+            print(f"Error: {pt_file} is not a valid batch file")
     if existing_batches:
         print(f"断点续跑: 以下批次已存在，将跳过: {sorted(existing_batches)}")
 
@@ -640,18 +651,28 @@ def solve_trainset_and_save_batches(
             with ProcessPoolExecutor(max_workers=n_workers_batch) as executor:
                 for start in range(0, len(todo_list), chunk_size):
                     chunk = todo_list[start : start + chunk_size]
-                    args = [
-                        (str(jpath), time_limit, gap_rel, threads, ga_lookup.get(fname))
+                    # 用 submit + as_completed：每完成一个就打印一条，避免整块算完才输出导致长时间无输出
+                    future_to_item = {
+                        executor.submit(
+                            _solve_one_instance_unpack,
+                            (str(jpath), time_limit, gap_rel, threads, ga_lookup.get(fname)),
+                        ): (jpath, fname)
                         for (jpath, fname) in chunk
-                    ]
-                    results = list(executor.map(lambda a: _solve_one_instance(*a), args))
-                    for (jpath, fname), (name, bm, status, cmax, res) in zip(chunk, results):
+                    }
+                    for future in as_completed(future_to_item):
+                        jpath, fname = future_to_item[future]
+                        try:
+                            name, bm, status, cmax, res = future.result()
+                        except Exception as e:
+                            print(f"[{processed + 1}/{total_todo}] {fname} -> Error: {e}", flush=True)
+                            processed += 1
+                            continue
                         processed += 1
                         if res and res.get("status") in ("Optimal", "Feasible"):
                             entry = milp_result_to_expert_entry(str(jpath), res)
                             if entry is not None:
                                 current_batch.append(entry)
-                        print(f"[{processed}/{total_todo}] {fname} -> status={status}, C_max={cmax}")
+                        print(f"[{processed}/{total_todo}] {fname} -> status={status}, C_max={cmax}", flush=True)
         else:
             for jpath, fname in todo_list:
                 processed += 1
@@ -668,7 +689,7 @@ def solve_trainset_and_save_batches(
                     entry = milp_result_to_expert_entry(str(jpath), res)
                     if entry is not None:
                         current_batch.append(entry)
-                print(f"[{processed}/{total_todo}] {fname} -> status={res['status']}, C_max={res.get('C_max')}")
+                print(f"[{processed}/{total_todo}] {fname} -> status={res['status']}, C_max={res.get('C_max')}", flush=True)
 
         if current_batch:
             batch_path = Path(milp_batch_dir) / f"milp_expert_data_batch_{batch_id}.pt"
@@ -712,7 +733,8 @@ def run_generalization_temp_benchmark(
 if __name__ == "__main__":
     # 对 Trainset 求解 MILP，使用 ga_expert_batches 的 makespan 作为 Big-M 加速，每 1000 个保存为 milp_expert_data_batch_*.pt，支持断点续跑
     solve_trainset_and_save_batches(
-        folder="Trainset",
+        # folder="Trainset",
+        folder="TestSet/Generalization_Temp",
         ga_expert_batches_dir="ga_expert_batches",
         milp_batch_dir="milp_expert_batches",
         BATCH_SIZE=1000,
