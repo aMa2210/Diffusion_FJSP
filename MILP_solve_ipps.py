@@ -2,8 +2,8 @@ import json
 import csv
 import os
 import re
-import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from itertools import combinations
 from pathlib import Path
 
@@ -31,29 +31,33 @@ def load_instance(path):
     return data["machines"], data["workpieces"]
 
 
-def load_ga_makespan_lookup_one_batch(ga_expert_batches_dir: str, batch_id: int) -> dict:
+def load_ga_makespan_lookup_from_csv(csv_path: str) -> dict:
     """
-    仅加载指定批次的 ga_expert_data_batch_{batch_id}.pt，返回 problem_file -> makespan 的映射。
-    按需调用，避免一次性加载所有 GA 批次占用过多内存。若文件不存在或读取出错则返回 {}。
+    从 GA 结果 CSV（如 results_GA_for_training_Diffusion.csv）读取 makespan，
+    返回 文件名 -> makespan 的映射。使用第三列（Stochastic_MK）作为上界。
+    若文件不存在或读取出错则返回 {}。
     """
-    batch_dir = Path(ga_expert_batches_dir)
-    pt_file = batch_dir / f"ga_expert_data_batch_{batch_id}.pt"
-    if not pt_file.exists():
+    path = Path(csv_path)
+    if not path.exists():
         return {}
+    lookup = {}
     try:
-        # GA 批次为 list of dict（含 tensors），需完整反序列化；显式 weights_only=False 并忽略安全提示
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            batch = torch.load(pt_file, map_location="cpu", weights_only=False)
-        if not isinstance(batch, list):
-            return {}
-        lookup = {}
-        for entry in batch:
-            if isinstance(entry, dict) and "problem_file" in entry and "makespan" in entry:
-                lookup[entry["problem_file"]] = float(entry["makespan"])
+        with path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                fname = row[0].strip()
+                if not fname:
+                    continue
+                try:
+                    # 第三列（索引 2）作为 makespan 上界
+                    lookup[fname] = float(row[2])
+                except (ValueError, IndexError):
+                    continue
         return lookup
     except Exception as e:
-        print(f"Warning: could not load {pt_file}: {e}")
+        print(f"Warning: could not load GA makespan from {csv_path}: {e}")
         return {}
 
 
@@ -108,6 +112,81 @@ def load_ga_makespan_lookup_one_batch(ga_expert_batches_dir: str, batch_id: int)
 #         plt.show()
 
 
+def _build_milp_model(machines, workpieces, cand_machines, proc_time, ops_on_machine, ops_per_job, num_jobs, big_m):
+    """用给定 big_m 构建 FJSP 的 PuLP 模型，返回 (model, S, Y, Z, C_max)。用于两阶段：先求可行解，再用 incumbent 收紧 big_m 重建并重解。"""
+    model = pulp.LpProblem("FJSP_Makespan_Minimization", pulp.LpMinimize)
+    S = {
+        (j, o): pulp.LpVariable(f"S_{j}_{o}", lowBound=0, cat="Continuous")
+        for j in range(num_jobs)
+        for o in range(ops_per_job[j])
+    }
+    Y = {
+        (j, o, m): pulp.LpVariable(f"Y_{j}_{o}_{m}", lowBound=0, upBound=1, cat="Binary")
+        for (j, o), mach_list in cand_machines.items()
+        for m in mach_list
+    }
+    C_max = pulp.LpVariable("C_max", lowBound=0, cat="Continuous")
+    Z = {}
+    for m in machines:
+        ops_m = ops_on_machine[m]
+        for (j1, o1), (j2, o2) in combinations(ops_m, 2):
+            if j1 == j2:
+                continue
+            Z[(m, j1, o1, j2, o2)] = pulp.LpVariable(
+                f"Z_{m}_{j1}_{o1}_{j2}_{o2}", lowBound=0, upBound=1, cat="Binary"
+            )
+    model += C_max, "Minimize_makespan"
+    for (j, o), mach_list in cand_machines.items():
+        model += (
+            pulp.lpSum(Y[(j, o, m)] for m in mach_list) == 1,
+            f"Select_one_machine_job{j}_op{o}",
+        )
+    for j in range(num_jobs):
+        for o in range(ops_per_job[j] - 1):
+            mach_list = cand_machines[(j, o)]
+            processing_expr = pulp.lpSum(
+                proc_time[(j, o, m)] * Y[(j, o, m)] for m in mach_list
+            )
+            model += (
+                S[(j, o + 1)] >= S[(j, o)] + processing_expr,
+                f"Job_precedence_j{j}_o{o}",
+            )
+    for m in machines:
+        ops_m = ops_on_machine[m]
+        for (j1, o1), (j2, o2) in combinations(ops_m, 2):
+            if j1 == j2:
+                continue
+            z_var = Z[(m, j1, o1, j2, o2)]
+            p_a = pulp.lpSum(
+                proc_time[(j1, o1, m2)] * Y[(j1, o1, m2)]
+                for m2 in cand_machines[(j1, o1)]
+            )
+            p_b = pulp.lpSum(
+                proc_time[(j2, o2, m2)] * Y[(j2, o2, m2)]
+                for m2 in cand_machines[(j2, o2)]
+            )
+            relax = big_m * (1 - Y[(j1, o1, m)]) + big_m * (1 - Y[(j2, o2, m)])
+            model += (
+                S[(j1, o1)] + p_a <= S[(j2, o2)] + big_m * (1 - z_var) + relax,
+                f"Mach_{m}_pair_{j1}_{o1}_before_{j2}_{o2}",
+            )
+            model += (
+                S[(j2, o2)] + p_b <= S[(j1, o1)] + big_m * z_var + relax,
+                f"Mach_{m}_pair_{j2}_{o2}_before_{j1}_{o1}",
+            )
+    for j in range(num_jobs):
+        last_op = ops_per_job[j] - 1
+        mach_list = cand_machines[(j, last_op)]
+        p_last = pulp.lpSum(
+            proc_time[(j, last_op, m)] * Y[(j, last_op, m)] for m in mach_list
+        )
+        model += (
+            C_max >= S[(j, last_op)] + p_last,
+            f"Define_Cmax_job{j}",
+        )
+    return model, S, Y, Z, C_max
+
+
 def build_and_solve_milp(
     instance_path: str,
     time_limit: int = None,
@@ -115,6 +194,7 @@ def build_and_solve_milp(
     gap_rel: float = None,
     threads: int = None,
     ga_makespan_ub: float = None,
+    first_solve_time_limit: int = 10,
     # gantt_path: str = None,  # 甘特图已关闭
 ):
     """
@@ -126,22 +206,14 @@ def build_and_solve_milp(
     - 同一时间每台机器最多加工一道工序。
     - 目标：最小化系统完工时间 C_max。
 
-    - ga_makespan_ub: 若提供（如从 GA 的 ga_expert_batches 读取的 makespan），用作 Big-M 上界，可加快求解。
+    - ga_makespan_ub: 若提供，用作 Big-M 初始上界，并添加约束 C_max <= ga_makespan_ub，保证解不差于 GA（否则可能因 CSV 缺该文件而得不到上界，出现 MILP 报“最优”大于 GA 的情况）。
+    - first_solve_time_limit: 默认 10。先以此秒数求一可行解，若得到则用该解的 makespan 收紧 Big-M 后重建模型再解，往往能更快证最优；设为 0 或 None 则关闭两阶段、只解一次。
     """
     machines, workpieces = load_instance(instance_path)
-
-    # 将工件索引化：job_id = 0..J-1
     num_jobs = len(workpieces)
-
-    # 预处理：记录每个 (job, op) 的候选机器和对应加工时间
-    # ops_per_job[j] = 工件 j 的工序数
     ops_per_job = [len(wp["optional_machines"]) for wp in workpieces]
-
-    # cand_machines[(j, o)] = [m1, m2, ...]
-    # proc_time[(j, o, m)] = p
     cand_machines = {}
     proc_time = {}
-
     for j, wp in enumerate(workpieces):
         opt_machs_list = wp["optional_machines"]
         proc_times_list = wp["processing_time"]
@@ -149,147 +221,95 @@ def build_and_solve_milp(
             cand_machines[(j, o)] = list(mach_list)
             for m, p in zip(mach_list, time_list):
                 proc_time[(j, o, m)] = p
-
-    # 为每台物理机器，列出所有可能在其上加工的工序 (j, o)
     ops_on_machine = {m: [] for m in machines}
     for (j, o), mach_list in cand_machines.items():
         for m in mach_list:
             ops_on_machine[m].append((j, o))
 
-    # Big-M 上界：需不小于任意可行 makespan。若提供 GA 的 makespan 则用之（可收紧松弛、加快求解）；否则用“每工序取最慢机器”之和作为保守上界。
     total_max = 0
     for j, wp in enumerate(workpieces):
         for p_list in wp["processing_time"]:
             total_max += max(p_list) if p_list else 0
     if ga_makespan_ub is not None and ga_makespan_ub > 0:
-        big_m = max(total_max, ga_makespan_ub)
+        big_m = min(total_max, ga_makespan_ub)
     else:
         big_m = total_max
-    big_m = 120
-    print(big_m)
-    # -------------------- 定义 MILP 模型 --------------------
-    model = pulp.LpProblem("FJSP_Makespan_Minimization", pulp.LpMinimize)
 
-    # 变量:
-    # S[j, o]: 工件 j 的第 o 道工序的开始时间 (连续非负)
-    S = {
-        (j, o): pulp.LpVariable(f"S_{j}_{o}", lowBound=0, cat="Continuous")
-        for j in range(num_jobs)
-        for o in range(ops_per_job[j])
-    }
+    def _add_ga_ub_constraint(model, C_max_var, ga_ub):
+        if ga_ub is not None and ga_ub > 0:
+            model += C_max_var <= ga_ub, "C_max_ub_from_GA"
 
-    # Y[j, o, m]: 如果工序 (j, o) 在机器 m 上加工，则为 1（仅当 m 是候选机器）
-    Y = {
-        (j, o, m): pulp.LpVariable(f"Y_{j}_{o}_{m}", lowBound=0, upBound=1, cat="Binary")
-        for (j, o), mach_list in cand_machines.items()
-        for m in mach_list
-    }
-
-    # C_max: 系统完工时间
-    C_max = pulp.LpVariable("C_max", lowBound=0, cat="Continuous")
-
-    # 对每台机器 m 上的每一对工序 a=(j1,o1), b=(j2,o2)，
-    # 使用二元变量 Z[m, a, b] 表示在机器 m 上 a 是否先于 b。
-    Z = {}
-    for m in machines:
-        ops_m = ops_on_machine[m]
-        for (j1, o1), (j2, o2) in combinations(ops_m, 2):
-            if j1 == j2:
-                continue
-            Z[(m, j1, o1, j2, o2)] = pulp.LpVariable(
-                f"Z_{m}_{j1}_{o1}_{j2}_{o2}", lowBound=0, upBound=1, cat="Binary"
-            )
-
-    # -------------------- 目标函数 --------------------
-    model += C_max, "Minimize_makespan"
-
-    # -------------------- 约束 --------------------
-
-    # 1) 每道工序必须在其候选机器中选择恰好一台机器
-    for (j, o), mach_list in cand_machines.items():
-        model += (
-            pulp.lpSum(Y[(j, o, m)] for m in mach_list) == 1,
-            f"Select_one_machine_job{j}_op{o}",
+    use_two_phase = first_solve_time_limit and first_solve_time_limit > 0
+    if use_two_phase:
+        model, S, Y, Z, C_max = _build_milp_model(
+            machines, workpieces, cand_machines, proc_time, ops_on_machine,
+            ops_per_job, num_jobs, big_m,
         )
-
-    # 2) 工件内部工序顺序：S[j,o+1] >= S[j,o] + p(j,o)
-    #    其中 p(j,o) = sum_m proc_time(j,o,m) * Y[j,o,m]
-    for j in range(num_jobs):
-        for o in range(ops_per_job[j] - 1):
-            mach_list = cand_machines[(j, o)]
-            processing_expr = pulp.lpSum(
-                proc_time[(j, o, m)] * Y[(j, o, m)] for m in mach_list
-            )
-            model += (
-                S[(j, o + 1)]
-                >= S[(j, o)] + processing_expr,
-                f"Job_precedence_j{j}_o{o}",
-            )
-
-    # 3) 机器不重叠约束 (disjunctive constraints)
-    #    仅当两道工序 a,b 都分配到机器 m 时，才强制其先后顺序；
-    #    否则通过 bigM * (1 - Y_a_m) 和 bigM * (1 - Y_b_m) 放松约束。
-    for m in machines:
-        ops_m = ops_on_machine[m]
-        for (j1, o1), (j2, o2) in combinations(ops_m, 2):
-            if j1 == j2:
-                continue
-            z_var = Z[(m, j1, o1, j2, o2)]
-
-            # a = (j1,o1) 的加工时间表达式
-            p_a = pulp.lpSum(
-                proc_time[(j1, o1, m2)] * Y[(j1, o1, m2)]
-                for m2 in cand_machines[(j1, o1)]
-            )
-            # b = (j2,o2)
-            p_b = pulp.lpSum(
-                proc_time[(j2, o2, m2)] * Y[(j2, o2, m2)]
-                for m2 in cand_machines[(j2, o2)]
-            )
-
-            # 仅当 Y[(j1,o1,m)]=1 且 Y[(j2,o2,m)]=1 时约束生效
-            relax = big_m * (1 - Y[(j1, o1, m)]) + big_m * (1 - Y[(j2, o2, m)])
-            model += (
-                S[(j1, o1)] + p_a
-                <= S[(j2, o2)] + big_m * (1 - z_var) + relax,
-                f"Mach_{m}_pair_{j1}_{o1}_before_{j2}_{o2}",
-            )
-            model += (
-                S[(j2, o2)] + p_b
-                <= S[(j1, o1)] + big_m * z_var + relax,
-                f"Mach_{m}_pair_{j2}_{o2}_before_{j1}_{o1}",
-            )
-
-    # 4) 定义 C_max：所有工件最后一道工序的完成时间都不能超过 C_max
-    for j in range(num_jobs):
-        last_op = ops_per_job[j] - 1
-        mach_list = cand_machines[(j, last_op)]
-        p_last = pulp.lpSum(
-            proc_time[(j, last_op, m)] * Y[(j, last_op, m)] for m in mach_list
+        _add_ga_ub_constraint(model, C_max, ga_makespan_ub)
+        solver_kw = {"timeLimit": first_solve_time_limit, "msg": msg}
+        if gap_rel is not None:
+            solver_kw["gapRel"] = gap_rel
+        if threads is not None:
+            solver_kw["threads"] = threads
+        solver = pulp.HiGHS(**solver_kw)
+        result_status = model.solve(solver)
+        status_str = pulp.LpStatus[result_status]
+        raw_cmax = pulp.value(C_max) if C_max is not None else None
+        if status_str in ("Optimal", "Feasible") and raw_cmax is not None and raw_cmax < big_m:
+            incumbent = int(np.ceil(raw_cmax))
+            big_m_new = min(big_m, incumbent)
+            if big_m_new < big_m and big_m_new >= 1:
+                big_m = big_m_new
+                if msg:
+                    print(f"Two-phase: tightening big_m to incumbent {big_m}, re-solving.")
+                model, S, Y, Z, C_max = _build_milp_model(
+                    machines, workpieces, cand_machines, proc_time, ops_on_machine,
+                    ops_per_job, num_jobs, big_m,
+                )
+                _add_ga_ub_constraint(model, C_max, ga_makespan_ub)
+                solver_kw2 = {"timeLimit": time_limit, "msg": msg}
+                if gap_rel is not None:
+                    solver_kw2["gapRel"] = gap_rel
+                if threads is not None:
+                    solver_kw2["threads"] = threads
+                solver2 = pulp.HiGHS(**solver_kw2)
+                result_status = model.solve(solver2)
+                status_str = pulp.LpStatus[result_status]
+        else:
+            # 第一阶段未得可行解或未证最优时：用同一模型再解一次，使用完整 time_limit（可为 None 表示不限制）
+            if status_str not in ("Optimal", "Feasible"):
+                solver_kw = {"timeLimit": time_limit, "msg": msg}
+                if gap_rel is not None:
+                    solver_kw["gapRel"] = gap_rel
+                if threads is not None:
+                    solver_kw["threads"] = threads
+                solver = pulp.HiGHS(**solver_kw)
+                result_status = model.solve(solver)
+                status_str = pulp.LpStatus[result_status]
+    else:
+        model, S, Y, Z, C_max = _build_milp_model(
+            machines, workpieces, cand_machines, proc_time, ops_on_machine,
+            ops_per_job, num_jobs, big_m,
         )
-        model += (
-            C_max >= S[(j, last_op)] + p_last,
-            f"Define_Cmax_job{j}",
-        )
+        _add_ga_ub_constraint(model, C_max, ga_makespan_ub)
+        solver_kw = {"timeLimit": time_limit, "msg": msg}
+        if gap_rel is not None:
+            solver_kw["gapRel"] = gap_rel
+        if threads is not None:
+            solver_kw["threads"] = threads
+        solver = pulp.HiGHS(**solver_kw)
+        result_status = model.solve(solver)
+        status_str = pulp.LpStatus[result_status]
 
-    # -------------------- 求解 --------------------
-    # HiGHS: Python API (需安装 highspy)；HiGHS_CMD: 命令行接口 (需 highs 可执行文件)
-    solver_kw = {"timeLimit": time_limit, "msg": msg}
-    if gap_rel is not None:
-        solver_kw["gapRel"] = gap_rel
-    if threads is not None:
-        solver_kw["threads"] = threads
-    solver = pulp.HiGHS(**solver_kw)
-    result_status = model.solve(solver)
+    # -------------------- 求解后处理与解提取 --------------------
 
-    status_str = pulp.LpStatus[result_status]
-
-    # 问题数据均为整数时，最优 C_max 理论为整数；求解器浮点运算会产生 107.99... 等，需取整
+    # 问题数据均为整数时，最优 C_max 及开始时间理论为整数；求解器浮点误差会产生 64.999998... 等
+    # 容差 1e-4：与整数的差小于 0.0001 则视为整数并取整返回
     def _round_if_integer(x):
         if x is None:
             return None
         r = round(x)
-        return r if abs(r - x) < 1e-6 else x
+        return r if abs(r - x) < 1e-4 else x
 
     if msg:
         print(f"Solve status: {status_str}")
@@ -419,6 +439,7 @@ def _solve_one_instance(
     gap_rel: float,
     threads: int,
     ga_makespan_ub: float = None,
+    first_solve_time_limit: int = 10,
 ) -> tuple:
     """
     供多进程调用的单实例求解，返回完整解以便主进程可构建 expert .pt。
@@ -432,6 +453,7 @@ def _solve_one_instance(
         gap_rel=gap_rel,
         threads=threads,
         ga_makespan_ub=ga_makespan_ub,
+        first_solve_time_limit=first_solve_time_limit,
     )
     cmax = res["C_max"]
     best_makespan = int(round(cmax)) if cmax is not None else ""
@@ -457,6 +479,7 @@ def solve_all_in_dir_and_save(
     threads: int = None,
     parallel_workers: int = 0,
     save_expert_pt: str = None,
+    first_solve_time_limit: int = 10,
     # gantt_dir: str = None,  # 甘特图已关闭
 ):
     """
@@ -472,6 +495,7 @@ def solve_all_in_dir_and_save(
     - save_expert_pt: 若指定路径（如 "milp_expert_data.pt"），将把每个实例的最优解转为与
       ga_expert_data.pt 相同格式并保存，供 Supervised_train.py 训练 diffusion 使用。
       可与 parallel_workers 同时使用（并行时也会传回完整解并写入 .pt）。
+    - first_solve_time_limit: 默认 10，先短时求可行解再收紧 Big-M 重解；0 或 None 关闭。
     """
     folder_path = Path(folder)
     json_files = sorted(folder_path.glob("*.json"), reverse=True)
@@ -497,6 +521,8 @@ def solve_all_in_dir_and_save(
                     time_limit,
                     gap_rel,
                     threads,
+                    None,
+                    first_solve_time_limit,
                 ): json_path
                 for json_path in json_files
             }
@@ -535,6 +561,7 @@ def solve_all_in_dir_and_save(
                 msg=False,
                 gap_rel=gap_rel,
                 threads=threads,
+                first_solve_time_limit=first_solve_time_limit,
             )
             cmax = res["C_max"]
             best_makespan = int(round(cmax)) if cmax is not None else ""
@@ -572,7 +599,7 @@ def get_instance_index(fname: str) -> int:
 
 def solve_trainset_and_save_batches(
     folder: str = "Trainset",
-    ga_expert_batches_dir: str = "ga_expert_batches",
+    ga_makespan_csv: str = "results_GA_for_training_Diffusion.csv",
     milp_batch_dir: str = "milp_expert_batches",
     BATCH_SIZE: int = 1000,
     time_limit: int = None,
@@ -580,17 +607,22 @@ def solve_trainset_and_save_batches(
     threads: int = None,
     parallel_workers: int = 0,
     chunk_size: int = None,
+    first_solve_time_limit: int = 10,
 ):
     """
-    对 Trainset 中每个任务求解 MILP，每 1000 个结果保存为一个 .pt 文件（与 ga_expert_batches 格式一致），支持断点续跑。
+    对 Trainset 中每个任务求解 MILP，每 1000 个结果保存为一个 .pt 文件，支持断点续跑。
+    GA makespan 上界仅从 ga_makespan_csv（按文件名、第三列）读取。
 
     - folder: Trainset 目录。
-    - ga_expert_batches_dir: GA 专家数据批次目录；若存在则读取每个实例的 GA makespan 作为 Big-M 上界以加速 MILP。
+    - ga_makespan_csv: GA 结果 CSV 路径（如 results_GA_for_training_Diffusion.csv），按文件名匹配、第三列作为 makespan 上界。
     - milp_batch_dir: 输出目录，保存 milp_expert_data_batch_0.pt, milp_expert_data_batch_1.pt, ...
     - BATCH_SIZE: 每批实例数（默认 1000）。
     - time_limit / gap_rel / threads: 传给 HiGHS。
     - parallel_workers: 并行进程数，0 表示串行。
     - chunk_size: 并行时每批提交的任务数，默认 max(parallel_workers*4, 32)。
+    - first_solve_time_limit: 默认 10，先短时求可行解再收紧 Big-M 重解；设为 0 或 None 关闭。
+    若出现 "process pool was terminated abruptly" / BrokenProcessPool，多为某 worker 被系统杀进程（如内存不足 OOM）：
+    可减小 parallel_workers（如 8）或设置 time_limit 限制单实例时间；当前实现会在检测到后把该 chunk 剩余任务改为串行重跑并继续。
     """
     folder_path = Path(folder)
     if not folder_path.exists():
@@ -630,7 +662,11 @@ def solve_trainset_and_save_batches(
     total_todo = sum(len(v) for v in todo_by_batch.values())
     batch_ids = sorted(todo_by_batch.keys())
     print(f"待处理 {total_todo} 个实例（共 {len(json_files)} 个），{len(batch_ids)} 个批次. BATCH_SIZE={BATCH_SIZE}.")
-    print("按批处理：每批仅加载对应 GA .pt 的 makespan，求解并保存后释放，再加载下一批.")
+
+    # 从 CSV 按文件名读取第三列作为 GA makespan 上界
+    ga_lookup = load_ga_makespan_lookup_from_csv(ga_makespan_csv) if ga_makespan_csv else {}
+    if ga_lookup:
+        print(f"已从 CSV 按文件名读取 GA makespan 上界：{ga_makespan_csv}，共 {len(ga_lookup)} 条.")
 
     use_parallel = parallel_workers and parallel_workers > 1
     if use_parallel:
@@ -640,39 +676,67 @@ def solve_trainset_and_save_batches(
     processed = 0
     for batch_id in batch_ids:
         todo_list = todo_by_batch[batch_id]
-        # 仅加载当前批次的 GA makespan，用完后本轮循环结束即释放
-        ga_lookup = load_ga_makespan_lookup_one_batch(ga_expert_batches_dir, batch_id)
-        n_ga = len(ga_lookup)
-        print(f"  [批次 {batch_id}] 已加载 GA makespan {n_ga} 条，待求解 {len(todo_list)} 个实例.")
+        n_ga = sum(1 for (_, fname) in todo_list if fname in ga_lookup)
+        print(f"  [批次 {batch_id}] GA makespan 可用 {n_ga}/{len(todo_list)} 条，待求解 {len(todo_list)} 个实例.")
 
         current_batch = []
         if use_parallel:
             n_workers_batch = min(n_workers, len(todo_list))
-            with ProcessPoolExecutor(max_workers=n_workers_batch) as executor:
-                for start in range(0, len(todo_list), chunk_size):
-                    chunk = todo_list[start : start + chunk_size]
-                    # 用 submit + as_completed：每完成一个就打印一条，避免整块算完才输出导致长时间无输出
+            for start in range(0, len(todo_list), chunk_size):
+                chunk = todo_list[start : start + chunk_size]
+                future_to_item = None
+                # 每个 chunk 使用独立进程池，避免单个 worker 被系统杀死（如 OOM）时拖垮整个批处理
+                with ProcessPoolExecutor(max_workers=n_workers_batch) as executor:
                     future_to_item = {
                         executor.submit(
                             _solve_one_instance_unpack,
-                            (str(jpath), time_limit, gap_rel, threads, ga_lookup.get(fname)),
+                            (str(jpath), time_limit, gap_rel, threads, ga_lookup.get(fname), first_solve_time_limit),
                         ): (jpath, fname)
                         for (jpath, fname) in chunk
                     }
+                    done_fnames = set()
+                    pool_broken = False
                     for future in as_completed(future_to_item):
                         jpath, fname = future_to_item[future]
                         try:
                             name, bm, status, cmax, res = future.result()
+                        except BrokenProcessPool as e:
+                            pool_broken = True
+                            print(f"[chunk] Worker died (often OOM); re-running remaining in chunk serially.", flush=True)
+                            remaining = [(jp, fn) for (jp, fn) in future_to_item.values() if fn not in done_fnames]
+                            for jp, fn in remaining:
+                                processed += 1
+                                try:
+                                    res = build_and_solve_milp(
+                                        instance_path=str(jp),
+                                        time_limit=time_limit,
+                                        msg=False,
+                                        gap_rel=gap_rel,
+                                        threads=threads,
+                                        ga_makespan_ub=ga_lookup.get(fn),
+                                        first_solve_time_limit=first_solve_time_limit,
+                                    )
+                                    if res and res.get("status") in ("Optimal", "Feasible"):
+                                        entry = milp_result_to_expert_entry(str(jp), res)
+                                        if entry is not None:
+                                            current_batch.append(entry)
+                                    print(f"[{processed}/{total_todo}] {fn} -> status={res['status']}, C_max={res.get('C_max')}", flush=True)
+                                except Exception as e2:
+                                    print(f"[{processed}/{total_todo}] {fn} -> Error: {e2}", flush=True)
+                            break
                         except Exception as e:
                             print(f"[{processed + 1}/{total_todo}] {fname} -> Error: {e}", flush=True)
                             processed += 1
                             continue
+                        done_fnames.add(fname)
                         processed += 1
                         if res and res.get("status") in ("Optimal", "Feasible"):
                             entry = milp_result_to_expert_entry(str(jpath), res)
                             if entry is not None:
                                 current_batch.append(entry)
                         print(f"[{processed}/{total_todo}] {fname} -> status={status}, C_max={cmax}", flush=True)
+                    if pool_broken:
+                        pass  # 已在本 chunk 内串行补跑完剩余任务，继续下一 chunk
         else:
             for jpath, fname in todo_list:
                 processed += 1
@@ -684,6 +748,7 @@ def solve_trainset_and_save_batches(
                     gap_rel=gap_rel,
                     threads=threads,
                     ga_makespan_ub=ga_ub,
+                    first_solve_time_limit=first_solve_time_limit,
                 )
                 if res and res.get("status") in ("Optimal", "Feasible"):
                     entry = milp_result_to_expert_entry(str(jpath), res)
@@ -695,50 +760,20 @@ def solve_trainset_and_save_batches(
             batch_path = Path(milp_batch_dir) / f"milp_expert_data_batch_{batch_id}.pt"
             torch.save(current_batch, batch_path)
             print(f"   -> 已保存批次 {batch_id} ({len(current_batch)} 条)")
-        # ga_lookup 在此处离开作用域，仅保留当前批的 MILP 结果，下一批会重新 load 下一个 .pt
 
     print(f"✅ MILP 专家数据已保存到 '{milp_batch_dir}'.")
 
 
-def run_generalization_temp_benchmark(
-    time_limit: int = 120,
-    gap_rel: float = 0.01,
-    parallel_workers: int = 0,
-    save_expert_pt: str = None,
-    # gantt_dir: str = None,  # 甘特图已关闭
-):
-    """
-    方便在 IDE 里直接运行的一键函数：
-    - 读取 `TestSet/Generalization_Temp/` 下全部 json
-    - 用 MILP 求 makespan
-    - 结果保存为 `result_milp_generalization_temp.csv`
-
-    - time_limit: 每个实例最大求解秒数，None 表示不限制。
-    - gap_rel: 相对间隙（如 0.01=1%），达到即停止，加快速度。
-    - parallel_workers: 并行进程数，0=串行，4 表示同时解 4 个实例（大幅缩短总时间）。
-    - save_expert_pt: 若指定（如 "milp_expert_data.pt"），会同时生成与 ga_expert_data.pt 同格式的
-      专家数据，供 Supervised_train 训练 diffusion；可与 parallel_workers 同时使用。
-    """
-    solve_all_in_dir_and_save(
-        folder="TestSet/Generalization_Temp",
-        output_csv="result_milp_generalization_temp.csv",
-        time_limit=time_limit,
-        gap_rel=gap_rel,
-        parallel_workers=parallel_workers,
-        save_expert_pt=save_expert_pt,
-        # gantt_dir=gantt_dir,
-    )
 
 
 if __name__ == "__main__":
-    # 对 Trainset 求解 MILP，使用 ga_expert_batches 的 makespan 作为 Big-M 加速，每 1000 个保存为 milp_expert_data_batch_*.pt，支持断点续跑
+    # 对 Trainset 求解 MILP，从 results_GA_for_training_Diffusion.csv 按文件名读取第三列作为 GA makespan 上界，每 1000 个保存为 milp_expert_data_batch_*.pt，支持断点续跑
     solve_trainset_and_save_batches(
-        # folder="Trainset",
-        folder="TestSet/Generalization_Temp",
-        ga_expert_batches_dir="ga_expert_batches",
+        folder="Trainset",
+        ga_makespan_csv="results_GA_for_training_Diffusion.csv",
         milp_batch_dir="milp_expert_batches",
         BATCH_SIZE=1000,
-        time_limit=None,
+        time_limit=300,
         gap_rel=None,
-        parallel_workers=8,
+        parallel_workers=32,
     )

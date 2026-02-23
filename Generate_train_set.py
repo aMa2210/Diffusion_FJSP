@@ -10,7 +10,7 @@ from Generate_random_problem_instances import generate_random_fjsp_problem
 # ================= 配置区域 =================
 
 # 输出目录 (你的训练脚本读取这个目录)
-OUTPUT_DIR = Path("Trainset")
+OUTPUT_DIR = Path("Trainset_smaller")
 
 # 总共想生成多少个训练样本？
 # 建议至少几百个，RL通常需要大量数据
